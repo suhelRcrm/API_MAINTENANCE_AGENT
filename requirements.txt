@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+motor
+pymongo
+pydantic-settings
+python-jose[cryptography]
+bcrypt
+huey[sqlite]
+langchain
+langchain-google-genai
+beautifulsoup4
+lxml
+PyGithub
+GitPython
+python-dotenv

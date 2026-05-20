@@ -1,0 +1,46 @@
+/* API Maintenance Agent — custom styles */
+
+body {
+    min-height: 100vh;
+}
+
+.font-monospace {
+    font-family: var(--bs-font-monospace);
+}
+
+/* Pre-formatted reasoning text */
+pre.reasoning-block {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.82rem;
+    max-height: 300px;
+    overflow-y: auto;
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 0.375rem;
+    padding: 0.75rem 1rem;
+}
+
+/* Status badge sizes */
+.badge {
+    font-size: 0.75rem;
+    letter-spacing: 0.02em;
+}
+
+/* Sticky table header */
+.table-sticky thead th {
+    position: sticky;
+    top: 0;
+    background: #f8f9fa;
+    z-index: 1;
+}
+
+/* Card hover effect for job rows */
+.table-hover tbody tr:hover {
+    cursor: pointer;
+}
+
+/* Classification color coding */
+.classification-safe    { border-left: 4px solid #198754; }
+.classification-bug     { border-left: 4px solid #dc3545; }
+.classification-unknown { border-left: 4px solid #ffc107; }
