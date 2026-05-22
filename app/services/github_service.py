@@ -8,10 +8,13 @@ while still using the cleaner API surface for branch/PR management.
 """
 import os
 import shutil
+import stat
+import time
 from typing import Optional
 
 from github import Github, GithubException
 from git import Repo
+from git.exc import GitCommandError
 
 from app.config import settings
 from app.logger import get_logger
@@ -102,15 +105,164 @@ def create_fix_branch_name(job_id: str) -> str:
 # Local repo operations (GitPython)
 # ---------------------------------------------------------------------------
 
+def _rmtree_onerror(func, path, _exc_info):
+    """Clear read-only flags on Windows so locked .git pack files can be removed."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except OSError:
+        pass
+
+
+def _release_git_locks(local_path: str) -> None:
+    """Close an existing repo handle and remove stale Git lock files."""
+    if not os.path.isdir(local_path):
+        return
+    try:
+        repo = Repo(local_path)
+        repo.close()
+    except Exception:
+        pass
+    for lock_name in ("index.lock", "HEAD.lock", "shallow.lock"):
+        lock_path = os.path.join(local_path, ".git", lock_name)
+        if os.path.isfile(lock_path):
+            try:
+                os.chmod(lock_path, stat.S_IWRITE)
+                os.unlink(lock_path)
+            except OSError:
+                pass
+
+
+def remove_local_repo(local_path: str, max_retries: int = 5, retry_delay: float = 0.5) -> None:
+    """
+    Delete a prior clone directory. Retries on Windows when .git pack files
+    are still locked by GitPython or a crashed worker.
+    """
+    if not os.path.exists(local_path):
+        return
+
+    _release_git_locks(local_path)
+    last_err: Optional[Exception] = None
+
+    for attempt in range(max_retries):
+        try:
+            shutil.rmtree(local_path, onerror=_rmtree_onerror)
+            return
+        except PermissionError as exc:
+            last_err = exc
+            _release_git_locks(local_path)
+            if attempt < max_retries - 1:
+                wait = retry_delay * (attempt + 1)
+                log.warning(
+                    "Repo directory locked — retrying removal",
+                    extra={"path": local_path, "attempt": attempt + 1, "wait_seconds": wait},
+                )
+                time.sleep(wait)
+
+    if last_err:
+        raise last_err
+
+
+def _is_retryable_git_clone_error(exc: BaseException) -> bool:
+    """Network/SSL/transfer errors that often succeed on retry."""
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    signals = (
+        "rpc failed",
+        "ssl_read",
+        "ssl routines",
+        "decryption failed",
+        "bad record mac",
+        "early eof",
+        "unexpected disconnect",
+        "invalid index-pack",
+        "curl 56",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "could not read",
+        "failed to connect",
+        "exit code(128)",
+        "exit code 128",
+    )
+    return any(s in msg for s in signals)
+
+
+def _clone_multi_options() -> list[str]:
+    """Git CLI options to improve clone reliability on large repos."""
+    opts = ["-c", "http.postBuffer=524288000"]
+    if settings.github_clone_depth > 0:
+        opts.extend(["--depth", str(settings.github_clone_depth)])
+    return opts
+
+
 def clone_repository(local_path: str) -> Repo:
-    """Clone repo using PAT-authenticated HTTPS URL."""
+    """
+    Clone repo using PAT-authenticated HTTPS URL.
+    Retries transient network/SSL failures and removes partial clones between attempts.
+    """
     auth_url = (
         f"https://{settings.github_pat}@github.com/"
         f"{settings.github_repo_owner}/{settings.github_repo_name}.git"
     )
-    if os.path.exists(local_path):
-        shutil.rmtree(local_path)
-    return Repo.clone_from(auth_url, local_path, branch=settings.github_default_branch)
+    max_retries = settings.git_clone_max_retries
+    delay = settings.git_clone_retry_delay_seconds
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(max_retries):
+        try:
+            remove_local_repo(local_path)
+            log.info(
+                "Cloning repository",
+                extra={
+                    "path": local_path,
+                    "branch": settings.github_default_branch,
+                    "attempt": attempt + 1,
+                    "max_retries": max_retries,
+                },
+            )
+            return Repo.clone_from(
+                auth_url,
+                local_path,
+                branch=settings.github_default_branch,
+                allow_unsafe_options=True,
+                multi_options=_clone_multi_options(),
+            )
+        except Exception as exc:
+            last_exc = exc
+            log.warning(
+                "Git clone attempt failed",
+                extra={
+                    "path": local_path,
+                    "attempt": attempt + 1,
+                    "error": str(exc)[:500],
+                },
+            )
+            try:
+                remove_local_repo(local_path)
+            except Exception as cleanup_exc:
+                log.warning(
+                    "Could not remove partial clone after failed attempt",
+                    extra={"path": local_path, "error": str(cleanup_exc)},
+                )
+
+            if attempt < max_retries - 1 and _is_retryable_git_clone_error(exc):
+                wait = delay * (attempt + 1)
+                log.warning(
+                    "Retrying git clone after transient error",
+                    extra={"wait_seconds": wait, "next_attempt": attempt + 2},
+                )
+                time.sleep(wait)
+                continue
+            break
+
+    if last_exc:
+        raise RuntimeError(
+            f"Git clone failed after {max_retries} attempt(s) "
+            f"({settings.github_repo_owner}/{settings.github_repo_name} "
+            f"branch={settings.github_default_branch}): {last_exc}"
+        ) from last_exc
+    raise RuntimeError(f"Git clone failed for {local_path}")
 
 
 def write_fixed_file(local_repo_path: str, file_path: str, new_content: str) -> None:
@@ -163,30 +315,65 @@ def create_remote_branch(branch_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def generate_pr_body(job_id: str, fixed_failures: list[dict]) -> str:
+    java_fixes = [f for f in fixed_failures if f.get("fix_type", "java") == "java"]
+    schema_fixes = [f for f in fixed_failures if f.get("fix_type") == "schema"]
+
     lines = [
         f"## Automated Test Fixes — Job `{job_id}`",
         "",
         "This PR was generated by the **Agentic Test Suite Maintenance System**.",
-        "All changes have been reviewed and approved by a QA engineer.",
+        f"**{len(fixed_failures)} test(s) fixed** — "
+        f"{len(java_fixes)} Java assertion change(s), "
+        f"{len(schema_fixes)} JSON schema update(s).",
         "",
-        "### Changes Made",
+        "---",
         "",
-        "| Test Name | File | Change Summary |",
-        "|-----------|------|----------------|",
     ]
-    for f in fixed_failures:
-        lines.append(
-            f"| `{f['test_name']}` "
-            f"| `{f['test_class_path']}` "
-            f"| {f.get('changes_description', 'Assertion updated')} |"
-        )
+
+    if java_fixes:
+        lines += [
+            f"### Java Assertion Changes ({len(java_fixes)} test(s))",
+            "",
+            "| # | Test Name | File | Change Summary |",
+            "|---|-----------|------|----------------|",
+        ]
+        for i, f in enumerate(java_fixes, 1):
+            file_short = f.get("test_class_path", "").split("/")[-1]
+            desc = f.get("changes_description", "Assertion updated")
+            lines.append(
+                f"| {i} | `{f['test_name']}` "
+                f"| `{file_short}` "
+                f"| {desc} |"
+            )
+        lines.append("")
+
+    if schema_fixes:
+        lines += [
+            f"### JSON Schema Updates ({len(schema_fixes)} test(s))",
+            "",
+            "| # | Test Name | Schema File | Change Summary |",
+            "|---|-----------|-------------|----------------|",
+        ]
+        for i, f in enumerate(schema_fixes, 1):
+            file_short = f.get("test_class_path", "").split("/")[-1]
+            desc = f.get("changes_description", "JSON schema type updated")
+            lines.append(
+                f"| {i} | `{f['test_name']}` "
+                f"| `{file_short}` "
+                f"| {desc} |"
+            )
+        lines.append("")
+
     lines += [
+        "---",
         "",
         "### Guardrail Classification",
-        "All modified tests were classified as `SAFE_TO_FIX` by the LLM classifier,",
-        "meaning they are negative/error scenarios where only the expected error value changed.",
         "",
-        "> ⚠️ Tests classified as `BACKEND_BUG` were excluded and require manual investigation.",
+        "All modified tests were classified as `SAFE_TO_FIX` by the LLM classifier.",
+        "Changes are limited to assertion values and JSON schema type definitions.",
+        "",
+        "> ⚠️ **Reviewer**: Please verify each change reflects the intentional API behaviour before merging.",
+        "> Tests classified as `BACKEND_BUG` were excluded and require manual investigation.",
     ]
     return "\n".join(lines)
 

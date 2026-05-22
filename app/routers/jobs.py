@@ -8,9 +8,10 @@ from fastapi.templating import Jinja2Templates
 from bson import ObjectId
 
 from app.dependencies import get_current_user
-from app.models.job import Job, JobStatus
-from app.models.test_failure import Classification
+from app.models.job import Job, JobFailedStage, JobStatus
+from app.models.test_failure import Classification, FixStatus
 from app.config import settings
+from app.services.job_pipeline import all_failures_classified, count_unclassified
 import app.database as db_module
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -25,15 +26,21 @@ async def upload_report(
 ):
     if not file.filename or not file.filename.lower().endswith(".html"):
         jobs = await db_module.jobs_collection \
-            .find({"user_id": current_user["id"]}) \
+            .find({}) \
             .sort("created_at", -1) \
-            .to_list(50)
+            .to_list(100)
+        user_ids = list({j["user_id"] for j in jobs if j.get("user_id")})
+        users = await db_module.users_collection.find(
+            {"id": {"$in": user_ids}}, {"id": 1, "username": 1}
+        ).to_list(None)
+        user_map = {u["id"]: u["username"] for u in users}
         return templates.TemplateResponse(
             request,
             "dashboard.html",
             {
                 "current_user": current_user,
                 "jobs": jobs,
+                "user_map": user_map,
                 "upload_error": "Only .html files are accepted.",
             },
             status_code=400,
@@ -57,9 +64,7 @@ async def upload_report(
 
 @router.get("/{job_id}", response_class=HTMLResponse)
 async def job_detail(job_id: str, request: Request, current_user=Depends(get_current_user)):
-    job = await db_module.jobs_collection.find_one(
-        {"id": job_id, "user_id": current_user["id"]}
-    )
+    job = await db_module.jobs_collection.find_one({"id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -67,21 +72,27 @@ async def job_detail(job_id: str, request: Request, current_user=Depends(get_cur
         {"job_id": job_id}
     ).to_list(None)
 
+    uploader = await db_module.users_collection.find_one(
+        {"id": job.get("user_id")}, {"username": 1}
+    )
+    uploaded_by = uploader["username"] if uploader else job.get("user_id", "—")
+
     return templates.TemplateResponse(request, "job_detail.html", {
         "current_user": current_user,
         "job": job,
+        "uploaded_by": uploaded_by,
         "failures": failures,
         "JobStatus": JobStatus,
+        "JobFailedStage": JobFailedStage,
         "Classification": Classification,
+        "FixStatus": FixStatus,
     })
 
 
 
 @router.post("/{job_id}/retry")
 async def retry_job(job_id: str, current_user=Depends(get_current_user)):
-    job = await db_module.jobs_collection.find_one(
-        {"id": job_id, "user_id": current_user["id"]}
-    )
+    job = await db_module.jobs_collection.find_one({"id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -95,12 +106,27 @@ async def retry_job(job_id: str, current_user=Depends(get_current_user)):
         return response
 
     error_msg = job.get("error_message", "") or ""
+    failed_stage = job.get("last_failed_stage")
 
-    # Determine which stage failed and resume from there
-    if "execute:" in error_msg:
+    # Prefer explicit stage; fall back for jobs created before last_failed_stage existed
+    if not failed_stage:
+        if "execute:" in error_msg:
+            failed_stage = JobFailedStage.EXECUTE
+        elif "classify:" in error_msg:
+            failed_stage = JobFailedStage.CLASSIFY
+        else:
+            failed_stage = JobFailedStage.PARSE
+
+    clear_fields = {
+        "error_message": None,
+        "last_failed_stage": None,
+        "updated_at": datetime.utcnow(),
+    }
+
+    if failed_stage == JobFailedStage.EXECUTE or failed_stage == JobFailedStage.EXECUTE.value:
         # Parse + classify already done — re-run fixes only
         safe_failures = await db_module.failures_collection.find(
-            {"job_id": job_id, "classification": "SAFE_TO_FIX", "user_approved": True}
+            {"job_id": job_id, "classification": Classification.SAFE_TO_FIX}
         ).to_list(None)
         safe_ids = [f["id"] for f in safe_failures]
 
@@ -115,39 +141,68 @@ async def retry_job(job_id: str, current_user=Depends(get_current_user)):
 
         await db_module.jobs_collection.update_one(
             {"id": job_id},
-            {"$set": {
-                "status": JobStatus.EXECUTING_FIXES,
-                "error_message": None,
-                "updated_at": datetime.utcnow(),
-            }},
+            {"$set": {**clear_fields, "status": JobStatus.EXECUTING_FIXES}},
         )
         from app.tasks.huey_tasks import task_execute_fixes
         task_execute_fixes(job_id, safe_ids)
         flash = "info:Re-running fix execution (skipping parse & classify)."
 
-    elif "classify:" in error_msg:
-        # Parse done — re-run classify only (failures already in DB)
-        await db_module.jobs_collection.update_one(
-            {"id": job_id},
-            {"$set": {
-                "status": JobStatus.PENDING_CLASSIFICATION,
-                "error_message": None,
-                "updated_at": datetime.utcnow(),
-            }},
-        )
-        from app.tasks.huey_tasks import task_classify_failures
-        task_classify_failures(job_id)
-        flash = "info:Re-running classification (skipping parse)."
+    elif failed_stage == JobFailedStage.CLASSIFY or failed_stage == JobFailedStage.CLASSIFY.value:
+        failures_col = db_module.failures_collection
+        if await all_failures_classified(failures_col, job_id):
+            safe_failures = await failures_col.find(
+                {"job_id": job_id, "classification": Classification.SAFE_TO_FIX}
+            ).to_list(None)
+            safe_ids = [f["id"] for f in safe_failures]
+            if safe_ids:
+                await failures_col.update_many(
+                    {"id": {"$in": safe_ids}},
+                    {"$set": {
+                        "user_approved": True,
+                        "fix_status": FixStatus.PENDING,
+                        "fix_reason": None,
+                    }},
+                )
+                await db_module.jobs_collection.update_one(
+                    {"id": job_id},
+                    {"$set": {**clear_fields, "status": JobStatus.EXECUTING_FIXES}},
+                )
+                from app.tasks.huey_tasks import task_execute_fixes
+                task_execute_fixes(job_id, safe_ids)
+                flash = (
+                    "info:Classification already saved in DB — resuming fix execution "
+                    "(no LLM re-classification)."
+                )
+            else:
+                await db_module.jobs_collection.update_one(
+                    {"id": job_id},
+                    {"$set": {**clear_fields, "status": JobStatus.COMPLETED}},
+                )
+                flash = (
+                    "info:All failures already classified in DB (none SAFE_TO_FIX). "
+                    "Job marked complete."
+                )
+        else:
+            remaining = await count_unclassified(failures_col, job_id)
+            await db_module.jobs_collection.update_one(
+                {"id": job_id},
+                {"$set": {**clear_fields, "status": JobStatus.PENDING_CLASSIFICATION}},
+            )
+            from app.tasks.huey_tasks import task_classify_failures
+            task_classify_failures(job_id)
+            flash = (
+                f"info:Re-running classification for {remaining} unclassified failure(s) "
+                "(already-labeled rows are skipped)."
+            )
 
     else:
         # Parse failed or unknown — full restart
         await db_module.jobs_collection.update_one(
             {"id": job_id},
             {"$set": {
+                **clear_fields,
                 "status": JobStatus.PARSING,
-                "error_message": None,
                 "github_pr_url": None,
-                "updated_at": datetime.utcnow(),
             }},
         )
         await db_module.failures_collection.delete_many({"job_id": job_id})
@@ -164,7 +219,7 @@ async def retry_job(job_id: str, current_user=Depends(get_current_user)):
 @router.post("/{job_id}/delete")
 async def delete_job(job_id: str, current_user=Depends(get_current_user)):
     job = await db_module.jobs_collection.find_one(
-        {"id": job_id, "user_id": current_user["id"]}
+        {"id": job_id}
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")

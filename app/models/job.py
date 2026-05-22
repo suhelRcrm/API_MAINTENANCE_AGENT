@@ -13,6 +13,13 @@ class JobStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class JobFailedStage(str, Enum):
+    """Pipeline stage active when the job last failed (used for smart retry)."""
+    PARSE = "parse"
+    CLASSIFY = "classify"
+    EXECUTE = "execute"
+
+
 class Job(BaseModel):
     id: str = Field(default_factory=lambda: str(ObjectId()))
     user_id: str
@@ -20,6 +27,7 @@ class Job(BaseModel):
     status: JobStatus = JobStatus.PARSING
     github_pr_url: Optional[str] = None
     error_message: Optional[str] = None
+    last_failed_stage: Optional[JobFailedStage] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

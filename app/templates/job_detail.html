@@ -36,6 +36,8 @@
           <span class="font-monospace text-muted">{{ job.id }}</span>
         </h5>
         <small class="text-muted">
+          <i class="bi bi-person-circle me-1"></i>{{ uploaded_by }}
+          &nbsp;|&nbsp;
           Created: {{ job.created_at.strftime('%Y-%m-%d %H:%M:%S') if job.created_at else '—' }}
           &nbsp;|&nbsp;
           Updated: {{ job.updated_at.strftime('%Y-%m-%d %H:%M:%S') if job.updated_at else '—' }}
@@ -55,8 +57,12 @@
     <div class="alert alert-danger mt-3 mb-0 py-2 d-flex justify-content-between align-items-center">
       <div>
         <i class="bi bi-exclamation-triangle-fill me-1"></i>
-        <strong>Error:</strong>
-        {{ job.error_message if job.error_message else 'An unknown error occurred.' }}
+        <strong>Error</strong>
+        {% if job.last_failed_stage %}
+        <span class="badge bg-dark ms-1">failed at: {{ job.last_failed_stage }}</span>
+        {% endif %}
+        <br>
+        <span class="small">{{ job.error_message if job.error_message else 'An unknown error occurred.' }}</span>
       </div>
       <form method="POST" action="/jobs/{{ job.id }}/retry" class="ms-3 flex-shrink-0">
         <button type="submit" class="btn btn-sm btn-danger">
@@ -90,6 +96,10 @@
 {% set safe_count = failures | selectattr('classification', 'equalto', 'SAFE_TO_FIX') | list | length %}
 {% set bug_count  = failures | selectattr('classification', 'equalto', 'BACKEND_BUG')  | list | length %}
 {% set unclassified_count = failures | selectattr('classification', 'equalto', 'UNCLASSIFIED') | list | length %}
+{% set fix_fixed_count = failures | selectattr('fix_status', 'equalto', 'FIXED') | list | length %}
+{% set fix_skipped_count = failures | selectattr('fix_status', 'equalto', 'SKIPPED') | list | length %}
+{% set fix_pending_count = failures | selectattr('fix_status', 'equalto', 'PENDING') | list | length %}
+{% set fix_failed_count = failures | selectattr('fix_status', 'equalto', 'FAILED') | list | length %}
 
 {% if safe_count or bug_count or unclassified_count %}
 <div class="row g-3 mb-4">
@@ -97,8 +107,16 @@
     <div class="card border-0 shadow-sm text-center py-3">
       <div class="display-6 fw-bold text-success">{{ safe_count }}</div>
       <div class="small text-muted mt-1">
-        <i class="bi bi-robot me-1"></i>Auto-Fixed by Agent
+        <i class="bi bi-robot me-1"></i>Safe to Fix
       </div>
+      {% if fix_fixed_count or fix_skipped_count or fix_pending_count or fix_failed_count %}
+      <div class="small mt-2">
+        <span class="badge bg-success">{{ fix_fixed_count }} Fixed</span>
+        {% if fix_skipped_count %}<span class="badge bg-secondary ms-1">{{ fix_skipped_count }} Skipped</span>{% endif %}
+        {% if fix_pending_count %}<span class="badge bg-warning text-dark ms-1">{{ fix_pending_count }} Pending</span>{% endif %}
+        {% if fix_failed_count %}<span class="badge bg-danger ms-1">{{ fix_failed_count }} Failed</span>{% endif %}
+      </div>
+      {% endif %}
     </div>
   </div>
   <div class="col-sm-4">
@@ -150,6 +168,7 @@
           <tr>
             <th>Test Name</th>
             <th>Classification</th>
+            <th>Fix Status</th>
             <th>Assertion Error</th>
             <th class="text-end pe-3">Details</th>
           </tr>
@@ -180,10 +199,22 @@
             </td>
             <td>
               <span class="badge bg-{{ badge_class }}">{{ failure.classification or '—' }}</span>
-              {% if failure.user_approved %}
-              <span class="ms-1 text-success small" title="Agent auto-fixed">
-                <i class="bi bi-robot"></i>
-              </span>
+            </td>
+            <td>
+              {% if failure.classification == 'SAFE_TO_FIX' %}
+                {% if failure.fix_status == 'FIXED' %}
+                <span class="badge bg-success">Fixed</span>
+                {% elif failure.fix_status == 'SKIPPED' %}
+                <span class="badge bg-secondary">Skipped</span>
+                {% elif failure.fix_status == 'PENDING' %}
+                <span class="badge bg-warning text-dark">Pending</span>
+                {% elif failure.fix_status == 'FAILED' %}
+                <span class="badge bg-danger">Failed</span>
+                {% else %}
+                <span class="badge bg-light text-dark border">—</span>
+                {% endif %}
+              {% else %}
+              <span class="text-muted small">N/A</span>
               {% endif %}
             </td>
             <td>
@@ -206,7 +237,7 @@
           </tr>
           <!-- Collapsible detail row -->
           <tr class="collapse detail-row" id="detail-{{ loop.index }}" data-filter="{{ filter_key }}">
-            <td colspan="4" class="bg-white border-bottom p-3">
+            <td colspan="5" class="bg-white border-bottom p-3">
               <div class="row g-3">
                 {% if failure.curl_command %}
                 <div class="col-12">
@@ -224,6 +255,12 @@
                 <div class="col-12 col-md-6">
                   <strong class="small text-muted">Full Assertion Error</strong>
                   <pre class="reasoning-block mt-1">{{ failure.assertion_error }}</pre>
+                </div>
+                {% endif %}
+                {% if failure.fix_reason %}
+                <div class="col-12">
+                  <strong class="small text-muted">Fix Notes</strong>
+                  <p class="small mt-1 mb-0">{{ failure.fix_reason }}</p>
                 </div>
                 {% endif %}
                 {% if failure.llm_reasoning %}

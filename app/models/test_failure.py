@@ -10,6 +10,15 @@ class Classification(str, Enum):
     UNCLASSIFIED = "UNCLASSIFIED"
 
 
+class FixStatus(str, Enum):
+    """Outcome of the automated fix step (SAFE_TO_FIX failures only)."""
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    PENDING = "PENDING"
+    FIXED = "FIXED"
+    SKIPPED = "SKIPPED"
+    FAILED = "FAILED"
+
+
 class TestFailure(BaseModel):
     id: str = Field(default_factory=lambda: str(ObjectId()))
     job_id: str
@@ -21,6 +30,8 @@ class TestFailure(BaseModel):
     classification: Classification = Classification.UNCLASSIFIED
     llm_reasoning: Optional[str] = None
     user_approved: bool = False
+    fix_status: FixStatus = FixStatus.NOT_APPLICABLE
+    fix_reason: Optional[str] = None
 
     class Config:
         populate_by_name = True

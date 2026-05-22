@@ -43,6 +43,7 @@
         <thead class="table-light">
           <tr>
             <th class="ps-3">Job ID</th>
+            <th>Uploaded By</th>
             <th>Status</th>
             <th>Created</th>
             <th>PR Link</th>
@@ -63,6 +64,12 @@
               <a href="/jobs/{{ job.id }}" class="text-decoration-none font-monospace small">
                 {{ job.id[:12] }}…
               </a>
+            </td>
+            <td>
+              <span class="small">
+                <i class="bi bi-person-circle me-1 text-muted"></i>
+                {{ user_map.get(job.user_id, '—') }}
+              </span>
             </td>
             <td>
               <span class="badge bg-{{ badge_map.get(job.status, 'secondary') }}">

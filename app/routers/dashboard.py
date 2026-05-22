@@ -16,10 +16,18 @@ async def root_redirect():
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, current_user=Depends(get_current_user)):
     jobs = await db_module.jobs_collection.find(
-        {"user_id": current_user["id"]}
-    ).sort("created_at", -1).to_list(50)
+        {}
+    ).sort("created_at", -1).to_list(100)
+
+    # Build user_id → username map for display
+    user_ids = list({j["user_id"] for j in jobs if j.get("user_id")})
+    users = await db_module.users_collection.find(
+        {"id": {"$in": user_ids}}, {"id": 1, "username": 1}
+    ).to_list(None)
+    user_map = {u["id"]: u["username"] for u in users}
 
     return templates.TemplateResponse(request, "dashboard.html", {
         "current_user": current_user,
         "jobs": jobs,
+        "user_map": user_map,
     })
