@@ -35,16 +35,28 @@ def _get_github_repo():
 # File fetching (pre-clone, used during classification)
 # ---------------------------------------------------------------------------
 
-def fetch_java_file(file_path: str) -> str:
+def fetch_java_file(file_path: str) -> tuple[str, str, bool]:
     """
-    Fetch raw Java source from GitHub via API.
+    Fetch raw file content from GitHub via API.
+
+    Returns (content_str, original_line_ending, original_had_trailing_newline).
+    Callers must pass original_line_ending and original_had_trailing_newline
+    to write_fixed_file() so the round-trip is byte-for-byte identical on
+    untouched lines.
+
     file_path must be the full repo-relative path, e.g.
     'src/test/java/com/example/OrderApiTest.java'
     """
     repo = _get_github_repo()
     try:
-        content = repo.get_contents(file_path, ref=settings.github_default_branch)
-        return content.decoded_content.decode("utf-8")
+        file_obj = repo.get_contents(file_path, ref=settings.github_default_branch)
+        raw_bytes: bytes = file_obj.decoded_content
+
+        original_ending = "\r\n" if b"\r\n" in raw_bytes else "\n"
+        original_had_trailing_newline = raw_bytes.endswith(b"\n")
+
+        content_str = raw_bytes.decode("utf-8")
+        return content_str, original_ending, original_had_trailing_newline
     except GithubException as e:
         raise FileNotFoundError(
             f"Could not fetch '{file_path}' from GitHub "
@@ -76,6 +88,17 @@ def resolve_file_path(class_path: str) -> str:
             "The parser did not extract a class name for this test failure."
         )
 
+    # Reject obvious non-test sources (parser should not emit these after the fix)
+    _LIBRARY_JAVA = {
+        "assert.java", "matcherassert.java", "jsonpath.java",
+        "directconstructorhandleaccessor.java", "method.java",
+    }
+    if java_file.lower() in _LIBRARY_JAVA:
+        raise FileNotFoundError(
+            f"Resolved filename '{java_file}' is a library/JDK class, not a project test. "
+            "Re-parse the report or check Script failed at method in the Extent HTML."
+        )
+
     repo = _get_github_repo()
     tree = repo.get_git_tree(settings.github_default_branch, recursive=True)
 
@@ -87,8 +110,25 @@ def resolve_file_path(class_path: str) -> str:
             f"{settings.github_repo_owner}/{settings.github_repo_name}"
         )
 
+    # Prefer test source trees over main or unrelated paths
+    def _match_rank(path: str) -> tuple[int, int]:
+        p = path.replace("\\", "/").lower()
+        if "/src/test/java/" in p:
+            tier = 0
+        elif "/test/" in p and p.endswith(".java"):
+            tier = 1
+        elif "/src/main/java/" in p:
+            tier = 3
+        else:
+            tier = 2
+        return (tier, len(p))
+
+    matches.sort(key=_match_rank)
     if len(matches) > 1:
-        log.warning("Multiple file matches, using first result", extra={"java_file": java_file, "matches": matches})
+        log.warning(
+            "Multiple file matches, using best-ranked path",
+            extra={"java_file": java_file, "chosen": matches[0], "all": matches[:5]},
+        )
 
     return matches[0]
 
@@ -265,12 +305,43 @@ def clone_repository(local_path: str) -> Repo:
     raise RuntimeError(f"Git clone failed for {local_path}")
 
 
-def write_fixed_file(local_repo_path: str, file_path: str, new_content: str) -> None:
-    """Write fixed Java content to the local working tree."""
+def write_fixed_file(
+    local_repo_path: str,
+    file_path: str,
+    content: str,
+    original_ending: str = "\n",
+    original_had_trailing_newline: bool = True,
+) -> None:
+    """
+    Write patched content back to disk with the SAME line endings and trailing-
+    newline state as the original file, so Git only sees the changed lines.
+
+    `content` is expected to use LF line endings (normalised during patching).
+    """
     full_path = os.path.join(local_repo_path, file_path)
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    with open(full_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
+
+    if original_ending == "\r\n":
+        content = content.replace("\n", "\r\n")
+
+    if original_had_trailing_newline and not content.endswith(original_ending):
+        content += original_ending
+    elif not original_had_trailing_newline and content.endswith(original_ending):
+        content = content.rstrip(original_ending)
+
+    log.debug(
+        "write_fixed_file line-ending check",
+        extra={
+            "path": file_path,
+            "ending": repr(original_ending),
+            "trailing_newline": original_had_trailing_newline,
+            "crlf_in_content": content.count("\r\n"),
+            "content_length": len(content),
+        },
+    )
+
+    with open(full_path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
 
 
 def commit_and_push_fixes(

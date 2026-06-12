@@ -6,9 +6,8 @@ Confirmed DOM structure from the actual sample report:
   - Test name:       <p class="name"> inside the test node
   - Assertion error: <textarea class="code-block"> plus script-failed row and curl
                      stackTrace/failureType when the textarea is minimal
-  - Class path:      resolved in order — (1) Java stack trace in code-block,
-                     (2) "testClass" in the curl JSON payload, (3) "Script failed
-                     at method: ClassName.method" in a fail event row
+  - Class path:      (1) Script failed at method, (2) curl testClass,
+                     (3) stack trace (project test frames only; skips MatcherAssert, etc.)
   - CURL command:    <details class="extent-http-capture"> whose <summary>
                      contains "curl" → inner <pre>
   - HTTP response:   <details class="extent-http-capture"> whose <summary>
@@ -40,13 +39,62 @@ _SCRIPT_FAILED_RE = re.compile(
 # testClass field inside the curl -d JSON body
 _TEST_CLASS_JSON_RE = re.compile(r'"testClass"\s*:\s*"([^"]+)"')
 _DATA_ROW_SUFFIX_RE = re.compile(r"\s+\[data row \d+\]$", re.IGNORECASE)
+# Extent report appends owner: "testMethod [data row 1] — Raj Pandey"
+_OWNER_SUFFIX_RE = re.compile(r"\s+—\s+.+$")
 _FAILURE_TYPE_JSON_RE = re.compile(r'"failureType"\s*:\s*"([^"]+)"')
 _STACK_TRACE_JSON_RE = re.compile(r'"stackTrace"\s*:\s*"((?:\\.|[^"\\])*)"')
 
+# JDK / TestNG / Hamcrest / JsonPath frames — not project test sources
+_NON_TEST_JAVA_FILES = frozenset({
+    "assert.java",
+    "matcherassert.java",
+    "jsonpath.java",
+    "directconstructorhandleaccessor.java",
+    "method.java",
+    "directmethodhandleaccessor.java",
+    "invoker.java",
+    "testrunner.java",
+    "suiteworker.java",
+    "methodinvocationhelper.java",
+    "threadutil.java",
+    "futuretask.java",
+    "threadpoolexecutor.java",
+})
+_NON_TEST_PACKAGE_PREFIXES = (
+    "java.",
+    "jdk.",
+    "javax.",
+    "sun.",
+    "org.hamcrest",
+    "org.testng",
+    "com.jayway.jsonpath",
+    "org.junit",
+)
+
 
 def _base_test_name(test_name: str) -> str:
-    """Strip data-provider suffix so method matching works."""
-    return _DATA_ROW_SUFFIX_RE.sub("", test_name).strip()
+    """Strip data-provider and Extent owner suffix for method matching."""
+    name = _OWNER_SUFFIX_RE.sub("", test_name)
+    return _DATA_ROW_SUFFIX_RE.sub("", name).strip()
+
+
+def _simple_java_filename(fqcn_or_path: str) -> str:
+    """Last path segment as lowercase filename, e.g. FooTest.java -> footest.java."""
+    base = fqcn_or_path.replace("\\", "/").split("/")[-1]
+    if not base.endswith(".java"):
+        base = f"{base}.java"
+    return base.lower()
+
+
+def _is_project_test_frame(fqcn: str, java_file_in_paren: str) -> bool:
+    """False for JDK/TestNG/Hamcrest/JsonPath stack frames."""
+    fqcn_lower = fqcn.lower()
+    for prefix in _NON_TEST_PACKAGE_PREFIXES:
+        if fqcn_lower.startswith(prefix):
+            return False
+    if _simple_java_filename(java_file_in_paren) in _NON_TEST_JAVA_FILES:
+        return False
+    return True
 
 
 def _fqcn_to_class_path(fqcn: str) -> str:
@@ -61,30 +109,34 @@ def _fqcn_to_class_path(fqcn: str) -> str:
 
 def _extract_class_path_from_stack(stack_trace: str, test_name: str) -> str:
     """
-    Walk stack-trace lines to find the first line whose method name matches
-    (or contains) the test name. Return the FQCN as a slash-separated path.
-
-    Falls back to the first line that looks like a test class if no exact match.
+    Walk stack-trace lines; prefer the frame for the failing test method.
+    Skips JDK/TestNG/Hamcrest frames (e.g. MatcherAssert.java).
     """
     test_name_lower = _base_test_name(test_name).lower()
-    first_candidate = ""
+    first_test_candidate = ""
 
     for line in stack_trace.splitlines():
         m = _STACK_LINE_RE.search(line.strip())
         if not m:
             continue
-        fqcn = m.group(1)          # e.g. "io.recruitcrm.account.LoginTest"
-        method = m.group(2)        # e.g. "myTestMethod"
+        fqcn = m.group(1)
+        method = m.group(2)
+        paren_m = re.search(r"\(([\w]+\.java):\d+\)", line)
+        java_file = paren_m.group(1) if paren_m else ""
 
-        if not first_candidate:
-            first_candidate = fqcn
+        if not _is_project_test_frame(fqcn, java_file):
+            continue
 
-        # Prefer the line whose method is the actual test method
         if method.lower() == test_name_lower or test_name_lower in method.lower():
             return fqcn.replace(".", "/") + ".java"
 
-    if first_candidate:
-        return first_candidate.replace(".", "/") + ".java"
+        if not first_test_candidate and (
+            method.endswith("Test") or method.endswith("_Test") or "Test" in fqcn
+        ):
+            first_test_candidate = fqcn
+
+    if first_test_candidate:
+        return first_test_candidate.replace(".", "/") + ".java"
 
     return ""
 
@@ -97,11 +149,17 @@ def _extract_class_path_from_curl(curl_command: str) -> str:
     return ""
 
 
-def _extract_class_path_from_script_failed(test_node: Tag, _test_name: str) -> str:
-    """
-    Parse "Script failed at method: SimpleClass.method" from fail event rows.
-    Returns a filename-only path (e.g. GetPitchCandidateContactsTest.java).
-    """
+def extract_class_path_from_script_failed_text(text: str) -> str:
+    """Parse 'Script failed at method: FooTest.bar' from report or assertion text."""
+    m = _SCRIPT_FAILED_RE.search(text)
+    if m:
+        return f"{m.group(1)}.java"
+    return ""
+
+
+def _extract_class_path_from_script_failed(test_node: Tag, test_name: str) -> str:
+    """Parse Script failed at method from fail event rows."""
+    base_method = _base_test_name(test_name).lower()
 
     for row in test_node.find_all("tr", class_="event-row"):
         for cell in row.find_all("td"):
@@ -109,23 +167,36 @@ def _extract_class_path_from_script_failed(test_node: Tag, _test_name: str) -> s
             if not m:
                 continue
             simple_class = m.group(1)
-            return f"{simple_class}.java"
+            method = m.group(2)
+            if (
+                method.lower() == base_method
+                or base_method in method.lower()
+                or not base_method
+            ):
+                return f"{simple_class}.java"
 
     return ""
 
 
-def _resolve_test_class_path(
-    test_node: Tag,
+def resolve_test_class_path(
+    test_node: Optional[Tag],
     assertion_error: Optional[str],
     test_name: str,
     curl_command: Optional[str],
 ) -> str:
     """
-    Resolve test_class_path using stack trace, then curl testClass, then
-    script-failed line (first match wins).
+    Resolve test_class_path (order matters):
+      1. Script failed at method (Extent row — most reliable for this report format)
+      2. curl JSON testClass (full FQCN)
+      3. Stack trace (project test frames only)
     """
+    if test_node is not None:
+        path = _extract_class_path_from_script_failed(test_node, test_name)
+        if path:
+            return path
+
     if assertion_error:
-        path = _extract_class_path_from_stack(assertion_error, test_name)
+        path = extract_class_path_from_script_failed_text(assertion_error)
         if path:
             return path
 
@@ -134,7 +205,12 @@ def _resolve_test_class_path(
         if path:
             return path
 
-    return _extract_class_path_from_script_failed(test_node, test_name)
+    if assertion_error:
+        path = _extract_class_path_from_stack(assertion_error, test_name)
+        if path:
+            return path
+
+    return ""
 
 
 def _extract_http_blocks(test_node: Tag) -> tuple[Optional[str], Optional[str]]:
@@ -249,7 +325,7 @@ def parse_extent_report(file_path: str, job_id: str) -> list[TestFailure]:
         assertion_error = _build_assertion_error(node, curl_command)
 
         # --- Class path: stack trace → curl testClass → script-failed line ---
-        test_class_path = _resolve_test_class_path(
+        test_class_path = resolve_test_class_path(
             node, assertion_error, test_name, curl_command
         )
 

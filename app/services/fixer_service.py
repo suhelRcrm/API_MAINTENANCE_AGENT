@@ -27,6 +27,18 @@ from app.config import settings
 log = logging.getLogger(__name__)
 
 
+def normalise_line_endings(content: str) -> str:
+    """Collapse \\r\\n → \\n for internal processing and LLM prompting."""
+    return content.replace("\r\n", "\n")
+
+
+def restore_line_endings(content: str, original_ending: str) -> str:
+    """Put original line endings back before writing to disk."""
+    if original_ending == "\r\n":
+        return content.replace("\n", "\r\n")
+    return content
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -658,6 +670,9 @@ def process_java_file_patches(
         return resolved_path, accumulated, file_had_fix, outcomes
 
     items = list(file_patches.items())
+    if not items:
+        return results
+
     if fw == 1 or len(items) == 1:
         for item in items:
             results.append(_process_one(item))

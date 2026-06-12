@@ -289,7 +289,12 @@ def task_execute_fixes(job_id: str, approved_failure_ids: list):
         local_repo = None  # track so we can close before rmtree
 
         try:
-            from app.services.fixer_service import apply_json_schema_update, process_java_file_patches
+            from app.services.fixer_service import (
+                apply_json_schema_update,
+                normalise_line_endings,
+                process_java_file_patches,
+            )
+            from app.services.parser_service import extract_class_path_from_script_failed_text
             from app.services.github_service import (
                 clone_repository,
                 create_remote_branch,
@@ -352,8 +357,15 @@ def task_execute_fixes(job_id: str, approved_failure_ids: list):
 
             file_patches: dict[str, dict] = {}
             for failure in failures:
+                class_path = failure.get("test_class_path") or ""
+                fallback = extract_class_path_from_script_failed_text(
+                    failure.get("assertion_error") or ""
+                )
+                if fallback:
+                    class_path = fallback
+
                 try:
-                    resolved_path = resolve_file_path(failure["test_class_path"])
+                    resolved_path = resolve_file_path(class_path)
                 except FileNotFoundError as exc:
                     log.warning(
                         "Cannot resolve file path — skipping",
@@ -368,8 +380,13 @@ def task_execute_fixes(job_id: str, approved_failure_ids: list):
                     continue
 
                 if resolved_path not in file_patches:
+                    java_source, original_ending, original_had_trailing_newline = fetch_java_file(
+                        resolved_path
+                    )
                     file_patches[resolved_path] = {
-                        "source": fetch_java_file(resolved_path),
+                        "source": normalise_line_endings(java_source),
+                        "original_ending": original_ending,
+                        "original_had_trailing_newline": original_had_trailing_newline,
                         "failures": [],
                     }
                 file_patches[resolved_path]["failures"].append(failure)
@@ -384,9 +401,16 @@ def task_execute_fixes(job_id: str, approved_failure_ids: list):
                 },
             )
 
-            for resolved_path, accumulated_source, file_had_fix, outcomes in process_java_file_patches(
-                file_patches
-            ):
+            patch_results: list = []
+            if not file_patches:
+                log.warning(
+                    "No test files resolved for fixing — check test_class_path / Script failed at method",
+                    extra={"job_id": job_id, "approved": len(failures)},
+                )
+            else:
+                patch_results = process_java_file_patches(file_patches)
+
+            for resolved_path, accumulated_source, file_had_fix, outcomes in patch_results:
                 for failure, fix_result, fix_exc in outcomes:
                     if fix_exc is not None:
                         log.warning(
@@ -475,7 +499,14 @@ def task_execute_fixes(job_id: str, approved_failure_ids: list):
                     )
 
                 if file_had_fix:
-                    write_fixed_file(local_repo_path, resolved_path, accumulated_source)
+                    patch_meta = file_patches[resolved_path]
+                    write_fixed_file(
+                        local_repo_path,
+                        resolved_path,
+                        accumulated_source,
+                        original_ending=patch_meta["original_ending"],
+                        original_had_trailing_newline=patch_meta["original_had_trailing_newline"],
+                    )
                     if resolved_path not in changed_files:
                         changed_files.append(resolved_path)
 
@@ -485,12 +516,21 @@ def task_execute_fixes(job_id: str, approved_failure_ids: list):
             # write to disk, register fixed tests in fixed_failures.
             # ---------------------------------------------------------------
             for schema_file, sp_data in schema_patches.items():
-                schema_source = fetch_java_file(schema_file)
-                schema_result = apply_json_schema_update(schema_source, sp_data["updates"])
+                schema_source, schema_ending, schema_trailing = fetch_java_file(schema_file)
+                schema_result = apply_json_schema_update(
+                    normalise_line_endings(schema_source),
+                    sp_data["updates"],
+                )
                 applied_paths = set(schema_result["applied_paths"])
 
                 if schema_result["content"]:
-                    write_fixed_file(local_repo_path, schema_file, schema_result["content"])
+                    write_fixed_file(
+                        local_repo_path,
+                        schema_file,
+                        schema_result["content"],
+                        original_ending=schema_ending,
+                        original_had_trailing_newline=schema_trailing,
+                    )
                     if schema_file not in changed_files:
                         changed_files.append(schema_file)
                     log.info(
@@ -586,10 +626,16 @@ def task_execute_fixes(job_id: str, approved_failure_ids: list):
                             "Fix step completed but no patch was applied for this test.",
                         )
 
-            commit_and_push_fixes(local_repo, branch_name, changed_files, job_id)
-
-            pr_body = generate_pr_body(job_id, fixed_failures)
-            pr_url = create_pull_request(job_id, branch_name, pr_body)
+            if changed_files:
+                commit_and_push_fixes(local_repo, branch_name, changed_files, job_id)
+                pr_body = generate_pr_body(job_id, fixed_failures)
+                pr_url = create_pull_request(job_id, branch_name, pr_body)
+            else:
+                pr_url = None
+                log.warning(
+                    "Execute finished with no file changes",
+                    extra={"job_id": job_id, "approved": len(failures)},
+                )
 
             await jobs_col.update_one(
                 {"id": job_id},
@@ -599,7 +645,10 @@ def task_execute_fixes(job_id: str, approved_failure_ids: list):
                     "updated_at": datetime.utcnow(),
                 }},
             )
-            log.info("Execute task complete", extra={"job_id": job_id, "pr_url": pr_url, "files_changed": len(changed_files)})
+            log.info(
+                "Execute task complete",
+                extra={"job_id": job_id, "pr_url": pr_url, "files_changed": len(changed_files)},
+            )
 
         except Exception as exc:
             log.error("Execute task failed", extra={"job_id": job_id, "error": str(exc)}, exc_info=True)

@@ -8,3 +8,4 @@ app/services/__pycache__
 app/tasks/__pycache__
 app/routers/__pycache__
 app/models/__pycache__
+reports

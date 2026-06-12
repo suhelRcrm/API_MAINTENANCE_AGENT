@@ -47,8 +47,9 @@ def test_file_fetch(class_name: str) -> str:
     print(f"    Resolved path: {resolved}")
 
     print(f"\n[2] Fetching file content from GitHub…")
-    content = fetch_java_file(resolved)
+    content, ending, trailing = fetch_java_file(resolved)
     print(f"    Content length: {len(content)} chars")
+    print(f"    Line ending: {ending!r}, trailing newline: {trailing}")
     print(f"    First 200 chars:\n    {content[:200]!r}")
     return resolved
 
@@ -71,8 +72,17 @@ def test_full_roundtrip(resolved_path: str):
         print("    Remote branch created.")
 
         print("    Writing dummy change…")
-        dummy_content = fetch_java_file(resolved_path) + "\n// Integration test dummy change\n"
-        write_fixed_file(local_path, resolved_path, dummy_content)
+        from app.services.fixer_service import normalise_line_endings
+
+        raw_content, ending, trailing = fetch_java_file(resolved_path)
+        dummy_content = normalise_line_endings(raw_content) + "\n// Integration test dummy change\n"
+        write_fixed_file(
+            local_path,
+            resolved_path,
+            dummy_content,
+            original_ending=ending,
+            original_had_trailing_newline=trailing,
+        )
 
         print("    Committing and pushing…")
         commit_and_push_fixes(local_repo, branch_name, [resolved_path], job_id="roundtrip-test")
